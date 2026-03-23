@@ -2,7 +2,6 @@ const express = require("express");
 const mongoose = require("mongoose");
 const dotenv = require("dotenv");
 const cors = require("cors");
-const path = require("path");
 const app = express();
 
 dotenv.config();
@@ -176,22 +175,6 @@ createCrudRoutes(IntTrophy, "int_trophies");
 createCrudRoutes(SeasonAwards, "season_awards");
 createCrudRoutes(Transfer, "transfers");
 app.use("/api", router);
-
-// Production UI: Vite build output (see Render build: cd fifamyplayer-frontend && npm run build)
-const distDir = path.join(__dirname, "..", "fifamyplayer-frontend", "dist");
-app.use(express.static(distDir));
-// Express 5 / path-to-regexp v8: bare "*" is invalid — use middleware after static
-app.use((req, res, next) => {
-  if (req.path.startsWith("/api")) {
-    return next();
-  }
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    return next();
-  }
-  res.sendFile(path.join(distDir, "index.html"), (err) => {
-    if (err) next(err);
-  });
-});
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
