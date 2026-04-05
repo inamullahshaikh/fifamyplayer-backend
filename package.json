@@ -6,7 +6,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "migrate:default-player": "node scripts/migrate-default-player.js"
+    "migrate:default-player": "node scripts/migrate-default-player.js",
+    "migrate:careers": "node scripts/migrate-career-player-ids.js"
   },
   "keywords": [],
   "author": "",
@@ -23,6 +24,7 @@
     "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.18.0",
     "mongoose": "^8.14.1",
+    "multer": "^2.1.1",
     "path": "^0.12.7"
   }
 }
