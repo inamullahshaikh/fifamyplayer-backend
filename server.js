@@ -31,9 +31,9 @@ const User = mongoose.model(
       username: { type: String, required: true, unique: true, trim: true },
       passwordHash: { type: String, required: true },
     },
-    { timestamps: true }
+    { timestamps: true },
   ),
-  "users"
+  "users",
 );
 
 // ✅ Add collection name as 3rd argument to avoid Mongoose pluralizing incorrectly
@@ -48,7 +48,7 @@ const Player = mongoose.model(
     retired: { type: Boolean, default: false },
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "players"
+  "players",
 );
 
 const SeasonData = mongoose.model(
@@ -63,7 +63,7 @@ const SeasonData = mongoose.model(
     team: String,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "seasondatas"
+  "seasondatas",
 );
 
 const YearlyData = mongoose.model(
@@ -74,7 +74,7 @@ const YearlyData = mongoose.model(
     assists: Number,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "yearlydatas"
+  "yearlydatas",
 );
 
 const SeasonTrophy = mongoose.model(
@@ -84,7 +84,7 @@ const SeasonTrophy = mongoose.model(
     competition: String,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "seasontrophies"
+  "seasontrophies",
 );
 
 const IntData = mongoose.model(
@@ -98,7 +98,7 @@ const IntData = mongoose.model(
     avgrating: Number,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "intdatas"
+  "intdatas",
 );
 
 const IntTrophy = mongoose.model(
@@ -108,7 +108,7 @@ const IntTrophy = mongoose.model(
     competition: String,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "inttrophies"
+  "inttrophies",
 );
 
 const SeasonAwards = mongoose.model(
@@ -119,7 +119,7 @@ const SeasonAwards = mongoose.model(
     quantity: Number,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "seasonawards"
+  "seasonawards",
 );
 
 const Transfer = mongoose.model(
@@ -131,7 +131,7 @@ const Transfer = mongoose.model(
     value: String,
     playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
   }),
-  "transfers"
+  "transfers",
 );
 
 function createToken(userId) {
@@ -153,16 +153,107 @@ function authMiddleware(req, res, next) {
   }
 }
 
+/** Max distinct career seasons / calendar years (independent caps). */
+const MAX_DISTINCT_SEASONS = 15;
+const MAX_DISTINCT_YEARS = 16;
+
+const SEASON_BODY_ROUTES = new Set([
+  "season_data",
+  "season_trophies",
+  "int_data",
+  "int_trophies",
+  "season_awards",
+  "transfers",
+]);
+
+function playerObjectId(userId) {
+  try {
+    return new mongoose.Types.ObjectId(String(userId));
+  } catch {
+    return null;
+  }
+}
+
+async function collectDistinctSeasons(playerId) {
+  const pid = playerObjectId(playerId);
+  if (!pid) return new Set();
+  const parts = await Promise.all([
+    SeasonData.distinct("season", { playerId: pid }),
+    IntData.distinct("season", { playerId: pid }),
+    SeasonTrophy.distinct("season", { playerId: pid }),
+    IntTrophy.distinct("season", { playerId: pid }),
+    SeasonAwards.distinct("season", { playerId: pid }),
+    Transfer.distinct("season", { playerId: pid }),
+  ]);
+  const set = new Set();
+  for (const arr of parts) {
+    for (const s of arr) {
+      const t = String(s ?? "").trim();
+      if (t) set.add(t);
+    }
+  }
+  return set;
+}
+
+async function collectDistinctYears(playerId) {
+  const pid = playerObjectId(playerId);
+  if (!pid) return new Set();
+  const years = await YearlyData.distinct("year", { playerId: pid });
+  const set = new Set();
+  for (const y of years) {
+    const t = String(y ?? "").trim();
+    if (t) set.add(t);
+  }
+  return set;
+}
+
+/** @returns {Promise<{ status: number, error: string, code: string } | null>} */
+async function getPostCapViolation(routeName, userId, body) {
+  const b = body && typeof body === "object" ? body : {};
+  if (routeName === "yearly_data") {
+    const year = String(b.year ?? "").trim();
+    if (!year) return null;
+    const years = await collectDistinctYears(userId);
+    if (years.size >= MAX_DISTINCT_YEARS && !years.has(year)) {
+      return {
+        status: 403,
+        code: "YEAR_CAP",
+        error: `You already have ${MAX_DISTINCT_YEARS} calendar years. Add totals only for a year you already use, or edit/delete an existing yearly row.`,
+      };
+    }
+    return null;
+  }
+  if (SEASON_BODY_ROUTES.has(routeName)) {
+    const season = String(b.season ?? "").trim();
+    if (!season) return null;
+    const seasons = await collectDistinctSeasons(userId);
+    if (seasons.size >= MAX_DISTINCT_SEASONS && !seasons.has(season)) {
+      return {
+        status: 403,
+        code: "SEASON_CAP",
+        error: `You already have ${MAX_DISTINCT_SEASONS} seasons. Add data only for a season you already use, or edit/delete existing rows.`,
+      };
+    }
+    return null;
+  }
+  return null;
+}
+
 const authRouter = express.Router();
 
 authRouter.post("/auth/register", async (req, res) => {
   try {
-    const username = String(req.body?.username || "").trim().toLowerCase();
+    const username = String(req.body?.username || "")
+      .trim()
+      .toLowerCase();
     const password = String(req.body?.password || "");
     if (!username || password.length < 6) {
       return res
         .status(400)
-        .json({ error: "Username is required and password must be at least 6 characters" });
+        .json({
+          error:
+            "Username is required and password must be at least 6 characters",
+        });
     }
     const existing = await User.findOne({ username });
     if (existing) {
@@ -182,10 +273,14 @@ authRouter.post("/auth/register", async (req, res) => {
 
 authRouter.post("/auth/login", async (req, res) => {
   try {
-    const username = String(req.body?.username || "").trim().toLowerCase();
+    const username = String(req.body?.username || "")
+      .trim()
+      .toLowerCase();
     const password = String(req.body?.password || "");
     if (!username || !password) {
-      return res.status(400).json({ error: "Username and password are required" });
+      return res
+        .status(400)
+        .json({ error: "Username and password are required" });
     }
     const user = await User.findOne({ username });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
@@ -203,9 +298,40 @@ authRouter.post("/auth/login", async (req, res) => {
 
 const router = express.Router();
 
+router.get("/data_entry_status", async (req, res) => {
+  try {
+    const seasonsSet = await collectDistinctSeasons(req.user.userId);
+    const yearsSet = await collectDistinctYears(req.user.userId);
+    const existingSeasons = [...seasonsSet].sort((a, b) =>
+      a.localeCompare(b, undefined, { numeric: true }),
+    );
+    res.json({
+      seasonCount: seasonsSet.size,
+      yearCount: yearsSet.size,
+      maxSeasons: MAX_DISTINCT_SEASONS,
+      maxYears: MAX_DISTINCT_YEARS,
+      seasonCapReached: seasonsSet.size >= MAX_DISTINCT_SEASONS,
+      yearCapReached: yearsSet.size >= MAX_DISTINCT_YEARS,
+      existingSeasons,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 function createCrudRoutes(model, routeName) {
   router.post(`/${routeName}`, async (req, res) => {
     try {
+      const violation = await getPostCapViolation(
+        routeName,
+        req.user.userId,
+        req.body,
+      );
+      if (violation) {
+        return res
+          .status(violation.status)
+          .json({ error: violation.error, code: violation.code });
+      }
       const doc = new model({ ...req.body, playerId: req.user.userId });
       await doc.save();
       res.status(201).json(doc);
@@ -245,8 +371,8 @@ function createCrudRoutes(model, routeName) {
         },
         { ...req.body, playerId: req.user.userId },
         {
-        new: true,
-        }
+          new: true,
+        },
       );
       if (!doc) return res.status(404).json({ error: "Not found" });
       res.json(doc);
