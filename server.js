@@ -41,9 +41,13 @@ app.use("/uploads", express.static(UPLOAD_ROOT));
 
 installBodyParsers(app);
 
-// ✅ MongoDB connection — fix dbName here
+// ✅ MongoDB — serverSelectionTimeoutMS helps slow cold starts; family: 4 avoids some IPv6/DNS issues.
+// If you still see querySrv ETIMEOUT with mongodb+srv://, use Atlas "standard connection string" (mongodb://…).
 mongoose
-  .connect(process.env.MONGO_URI)
+  .connect(process.env.MONGO_URI, {
+    serverSelectionTimeoutMS: 45_000,
+    family: 4,
+  })
   .then(() => console.log("✅ MongoDB connected"))
   .catch((err) => console.error("❌ MongoDB connection error:", err));
 
