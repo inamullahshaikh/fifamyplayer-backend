@@ -61,9 +61,20 @@ function applySecurity(app) {
   }
 }
 
+/**
+ * Strip keys like `$gt` from JSON bodies only. The default express-mongo-sanitize
+ * middleware reassigns req.query/req.params, which throws on Express 5 (read-only).
+ */
+function sanitizeJsonBody(req, _res, next) {
+  if (req.body != null && typeof req.body === "object") {
+    req.body = mongoSanitize.sanitize(req.body);
+  }
+  next();
+}
+
 function installBodyParsers(app) {
   app.use(express.json({ limit: "256kb" }));
-  app.use(mongoSanitize());
+  app.use(sanitizeJsonBody);
 }
 
 function authRateLimiter() {
