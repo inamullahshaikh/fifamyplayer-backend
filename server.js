@@ -11,6 +11,13 @@ const {
   normalizeSecurityAnswer,
   isAllowedQuestion,
 } = require("./securityQuestions");
+const {
+  isR2AvatarStorageEnabled,
+  safeAvatarExt,
+  avatarObjectKey,
+  uploadAvatarToR2,
+  removeStoredAvatar,
+} = require("./avatarStorage");
 const app = express();
 
 dotenv.config();
@@ -20,21 +27,6 @@ const AVATAR_DIR = path.join(UPLOAD_ROOT, "avatars");
 
 function ensureAvatarDir() {
   fs.mkdirSync(AVATAR_DIR, { recursive: true });
-}
-
-function unlinkAvatarFile(avatarUrl) {
-  if (!avatarUrl || typeof avatarUrl !== "string" || !avatarUrl.startsWith("/uploads/")) {
-    return;
-  }
-  const rel = avatarUrl.replace(/^\//, "");
-  const fp = path.join(__dirname, rel);
-  if (fs.existsSync(fp)) {
-    try {
-      fs.unlinkSync(fp);
-    } catch {
-      /* ignore */
-    }
-  }
 }
 
 app.use("/uploads", express.static(UPLOAD_ROOT));
@@ -87,7 +79,7 @@ const Player = mongoose.model(
       position: String,
       value: Number,
       retired: { type: Boolean, default: false },
-      /** Public URL path e.g. `/uploads/avatars/...` (set by upload endpoint only). */
+      /** Public URL: `https://...` (R2) or `/uploads/avatars/...` (local dev). */
       avatarUrl: { type: String, default: "" },
       playerId: { type: Schema.Types.ObjectId, ref: "User", index: true },
     },
@@ -772,14 +764,12 @@ const avatarStorage = multer.diskStorage({
     }
   },
   filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase();
-    const allowed = [".jpg", ".jpeg", ".png", ".gif", ".webp"];
-    const safe = allowed.includes(ext) ? ext : ".jpg";
+    const safe = safeAvatarExt(file.originalname);
     cb(null, `${req.params.id}-${Date.now()}${safe}`);
   },
 });
 
-const avatarUpload = multer({
+const avatarUploadLocal = multer({
   storage: avatarStorage,
   limits: { fileSize: 2 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
@@ -788,8 +778,18 @@ const avatarUpload = multer({
   },
 });
 
+const avatarUploadR2 = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith("image/")) cb(null, true);
+    else cb(new Error("Only image uploads are allowed"));
+  },
+});
+
 function runAvatarUpload(req, res, next) {
-  avatarUpload.single("avatar")(req, res, (err) => {
+  const upload = isR2AvatarStorageEnabled() ? avatarUploadR2 : avatarUploadLocal;
+  upload.single("avatar")(req, res, (err) => {
     if (err) {
       return res.status(400).json({ error: err.message || "Upload failed" });
     }
@@ -807,18 +807,33 @@ router.post("/players/:id/avatar", runAvatarUpload, async (req, res) => {
     const oid = userOid(req);
     const careerOid = playerObjectId(req.params.id);
     if (!careerOid) {
-      fs.unlinkSync(req.file.path);
+      if (req.file.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
       return res.status(400).json({ error: "Invalid player id" });
     }
     const p = await Player.findOne({ _id: careerOid, playerId: oid });
     if (!p) {
-      fs.unlinkSync(req.file.path);
+      if (req.file.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
       return res.status(404).json({ error: "Not found" });
     }
-    const publicPath = `/uploads/avatars/${req.file.filename}`;
-    unlinkAvatarFile(p.avatarUrl);
-    p.avatarUrl = publicPath;
-    await p.save();
+
+    if (isR2AvatarStorageEnabled()) {
+      const key = avatarObjectKey(req.params.id, req.file.originalname);
+      let newUrl = "";
+      try {
+        newUrl = await uploadAvatarToR2(req.file.buffer, req.file.mimetype, key);
+        await removeStoredAvatar(p.avatarUrl);
+        p.avatarUrl = newUrl;
+        await p.save();
+      } catch (e) {
+        if (newUrl) await removeStoredAvatar(newUrl);
+        throw e;
+      }
+    } else {
+      const publicPath = `/uploads/avatars/${req.file.filename}`;
+      await removeStoredAvatar(p.avatarUrl);
+      p.avatarUrl = publicPath;
+      await p.save();
+    }
     res.json(p);
   } catch (err) {
     if (req.file?.path && fs.existsSync(req.file.path)) {
@@ -838,7 +853,7 @@ router.delete("/players/:id/avatar", async (req, res) => {
     const careerOid = playerObjectId(req.params.id);
     const p = await Player.findOne({ _id: careerOid, playerId: oid });
     if (!p) return res.status(404).json({ error: "Not found" });
-    unlinkAvatarFile(p.avatarUrl);
+    await removeStoredAvatar(p.avatarUrl);
     p.avatarUrl = "";
     await p.save();
     res.json(p);
@@ -877,7 +892,7 @@ router.delete("/players/:id", async (req, res) => {
           "This career has season stats, trophies, or transfers. Remove that data first, or keep the profile.",
       });
     }
-    unlinkAvatarFile(p.avatarUrl);
+    await removeStoredAvatar(p.avatarUrl);
     await Player.findOneAndDelete({ _id: careerOid, playerId: oid });
     const u = await User.findById(oid).select("activeCareerPlayerId");
     if (u && String(u.activeCareerPlayerId) === String(careerOid)) {
@@ -906,4 +921,11 @@ app.use("/api", authRouter);
 app.use("/api", authMiddleware, router);
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(
+    isR2AvatarStorageEnabled()
+      ? "📦 Avatars: Cloudflare R2"
+      : "📦 Avatars: local disk (./uploads/avatars)",
+  );
+});
