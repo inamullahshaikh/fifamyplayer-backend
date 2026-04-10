@@ -18,6 +18,12 @@ const {
   uploadAvatarToR2,
   removeStoredAvatar,
 } = require("./avatarStorage");
+const {
+  applySecurity,
+  installBodyParsers,
+  authRateLimiter,
+  apiRateLimiter,
+} = require("./security");
 const app = express();
 
 dotenv.config();
@@ -29,10 +35,11 @@ function ensureAvatarDir() {
   fs.mkdirSync(AVATAR_DIR, { recursive: true });
 }
 
+applySecurity(app);
+
 app.use("/uploads", express.static(UPLOAD_ROOT));
 
-app.use(express.json());
-app.use(cors());
+installBodyParsers(app);
 
 // ✅ MongoDB connection — fix dbName here
 mongoose
@@ -205,6 +212,9 @@ function authMiddleware(req, res, next) {
 const MAX_DISTINCT_SEASONS = 15;
 const MAX_DISTINCT_YEARS = 16;
 
+const MAX_USERNAME_LENGTH = 64;
+const MAX_PASSWORD_LENGTH = 128;
+
 const SEASON_BODY_ROUTES = new Set([
   "season_data",
   "season_trophies",
@@ -328,22 +338,31 @@ async function getPostCapViolation(routeName, careerPlayerId, body) {
 }
 
 const authRouter = express.Router();
+authRouter.use(authRateLimiter());
 
 authRouter.post("/auth/register", async (req, res) => {
   try {
-    const username = String(req.body?.username || "")
-      .trim()
-      .toLowerCase();
+    const username = String(req.body?.username || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
     const securityQuestion = String(req.body?.securityQuestion || "").trim();
     const securityAnswer = String(req.body?.securityAnswer || "");
-    if (!username || password.length < 6) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Username is required and password must be at least 6 characters",
-        });
+    if (!username || username.length > MAX_USERNAME_LENGTH) {
+      return res.status(400).json({
+        error: !username
+          ? "Username is required"
+          : `Username must be at most ${MAX_USERNAME_LENGTH} characters`,
+      });
+    }
+    if (
+      password.length < 6 ||
+      password.length > MAX_PASSWORD_LENGTH
+    ) {
+      return res.status(400).json({
+        error: `Password must be between 6 and ${MAX_PASSWORD_LENGTH} characters`,
+      });
+    }
+    if (securityAnswer.length > MAX_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: "Security answer is too long" });
     }
     if (!isAllowedQuestion(securityQuestion)) {
       return res.status(400).json({ error: "Choose a valid security question" });
@@ -393,14 +412,18 @@ authRouter.post("/auth/register", async (req, res) => {
 
 authRouter.post("/auth/login", async (req, res) => {
   try {
-    const username = String(req.body?.username || "")
-      .trim()
-      .toLowerCase();
+    const username = String(req.body?.username || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
     if (!username || !password) {
       return res
         .status(400)
         .json({ error: "Username and password are required" });
+    }
+    if (
+      username.length > MAX_USERNAME_LENGTH ||
+      password.length > MAX_PASSWORD_LENGTH
+    ) {
+      return res.status(400).json({ error: "Invalid credentials" });
     }
     const user = await User.findOne({ username });
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
@@ -419,11 +442,12 @@ authRouter.post("/auth/login", async (req, res) => {
 /** Step 1: username → security question (if recovery is configured). */
 authRouter.post("/auth/recovery/question", async (req, res) => {
   try {
-    const username = String(req.body?.username || "")
-      .trim()
-      .toLowerCase();
+    const username = String(req.body?.username || "").trim().toLowerCase();
     if (!username) {
       return res.status(400).json({ error: "Username is required" });
+    }
+    if (username.length > MAX_USERNAME_LENGTH) {
+      return res.status(400).json({ error: "Invalid username" });
     }
     const user = await User.findOne({ username }).select(
       "securityQuestion securityAnswerHash",
@@ -449,12 +473,17 @@ authRouter.post("/auth/recovery/question", async (req, res) => {
 /** Step 2: verify answer and set new password. */
 authRouter.post("/auth/recovery/reset", async (req, res) => {
   try {
-    const username = String(req.body?.username || "")
-      .trim()
-      .toLowerCase();
+    const username = String(req.body?.username || "").trim().toLowerCase();
     const securityAnswer = String(req.body?.securityAnswer || "");
     const newPassword = String(req.body?.newPassword || "");
-    if (!username || !securityAnswer || newPassword.length < 6) {
+    if (
+      !username ||
+      !securityAnswer ||
+      newPassword.length < 6 ||
+      username.length > MAX_USERNAME_LENGTH ||
+      securityAnswer.length > MAX_PASSWORD_LENGTH ||
+      newPassword.length > MAX_PASSWORD_LENGTH
+    ) {
       return res.status(400).json({
         error:
           "Username, security answer, and a new password (min 6 characters) are required",
@@ -482,6 +511,7 @@ authRouter.post("/auth/recovery/reset", async (req, res) => {
 });
 
 const router = express.Router();
+router.use(apiRateLimiter());
 
 router.get("/me", async (req, res) => {
   try {
@@ -503,10 +533,14 @@ router.patch("/me/password", async (req, res) => {
   try {
     const currentPassword = String(req.body?.currentPassword || "");
     const newPassword = String(req.body?.newPassword || "");
-    if (newPassword.length < 6) {
-      return res
-        .status(400)
-        .json({ error: "New password must be at least 6 characters" });
+    if (
+      newPassword.length < 6 ||
+      newPassword.length > MAX_PASSWORD_LENGTH ||
+      currentPassword.length > MAX_PASSWORD_LENGTH
+    ) {
+      return res.status(400).json({
+        error: `New password must be between 6 and ${MAX_PASSWORD_LENGTH} characters`,
+      });
     }
     const user = await User.findById(req.user.userId);
     if (!user) return res.status(404).json({ error: "Not found" });
@@ -527,6 +561,12 @@ router.patch("/me/security", async (req, res) => {
     const currentPassword = String(req.body?.currentPassword || "");
     const securityQuestion = String(req.body?.securityQuestion || "").trim();
     const securityAnswer = String(req.body?.securityAnswer || "");
+    if (currentPassword.length > MAX_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: "Invalid password" });
+    }
+    if (securityAnswer.length > MAX_PASSWORD_LENGTH) {
+      return res.status(400).json({ error: "Security answer is too long" });
+    }
     if (!currentPassword) {
       return res.status(400).json({ error: "Current password is required" });
     }
