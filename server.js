@@ -18,12 +18,7 @@ const {
   uploadAvatarToR2,
   removeStoredAvatar,
 } = require("./avatarStorage");
-const {
-  applySecurity,
-  installBodyParsers,
-  authRateLimiter,
-  apiRateLimiter,
-} = require("./security");
+const { applySecurity, installBodyParsers } = require("./security");
 const app = express();
 
 dotenv.config();
@@ -109,6 +104,8 @@ const SeasonData = mongoose.model(
     goals: Number,
     assists: Number,
     avgrating: Number,
+    /** League place (e.g. "3") or cup / qualifier outcome label from the client. */
+    finish: { type: String, default: "" },
     team: String,
     playerId: { type: Schema.Types.ObjectId, ref: "Player", index: true },
   }),
@@ -145,6 +142,8 @@ const IntData = mongoose.model(
     goals: Number,
     assists: Number,
     avgrating: Number,
+    /** Tournament stage / league place / qualifier outcome (optional). */
+    finish: { type: String, default: "" },
     playerId: { type: Schema.Types.ObjectId, ref: "Player", index: true },
   }),
   "intdatas",
@@ -342,7 +341,6 @@ async function getPostCapViolation(routeName, careerPlayerId, body) {
 }
 
 const authRouter = express.Router();
-authRouter.use(authRateLimiter());
 
 authRouter.post("/auth/register", async (req, res) => {
   try {
@@ -515,7 +513,6 @@ authRouter.post("/auth/recovery/reset", async (req, res) => {
 });
 
 const router = express.Router();
-router.use(apiRateLimiter());
 
 router.get("/me", async (req, res) => {
   try {

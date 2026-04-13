@@ -1,9 +1,16 @@
 const express = require("express");
 const helmet = require("helmet");
 const cors = require("cors");
-const rateLimit = require("express-rate-limit");
 const morgan = require("morgan");
 const mongoSanitize = require("express-mongo-sanitize");
+
+/** Browsers hit these when the SPA runs on Vite (dev / preview). */
+const LOCAL_SPA_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:4173",
+  "http://127.0.0.1:4173",
+];
 
 function buildCorsOptions() {
   const raw = process.env.CORS_ORIGINS;
@@ -12,10 +19,12 @@ function buildCorsOptions() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  const prod = process.env.NODE_ENV === "production";
+  const allowed = prod ? list : [...new Set([...LOCAL_SPA_ORIGINS, ...list])];
   return {
     origin(origin, callback) {
       if (!origin) return callback(null, true);
-      if (list.includes(origin)) return callback(null, true);
+      if (allowed.includes(origin)) return callback(null, true);
       return callback(null, false);
     },
   };
@@ -77,28 +86,7 @@ function installBodyParsers(app) {
   app.use(sanitizeJsonBody);
 }
 
-function authRateLimiter() {
-  return rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: Math.max(5, Number(process.env.RATE_LIMIT_AUTH_MAX || 40)),
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: "Too many requests, try again later" },
-  });
-}
-
-function apiRateLimiter() {
-  return rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: Math.max(50, Number(process.env.RATE_LIMIT_API_MAX || 800)),
-    standardHeaders: true,
-    legacyHeaders: false,
-  });
-}
-
 module.exports = {
   applySecurity,
   installBodyParsers,
-  authRateLimiter,
-  apiRateLimiter,
 };
