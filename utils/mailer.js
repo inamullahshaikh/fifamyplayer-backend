@@ -2,6 +2,7 @@
  * Central Nodemailer transport (single cached instance).
  * Env: MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASS, MAIL_FROM, optional MAIL_FROM_NAME, MAIL_SECURE.
  * Legacy fallbacks: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM_ADDRESS.
+ * Use a transactional provider (e.g. Resend, SendGrid); MAIL_HOST has no default — set it explicitly.
  */
 
 const nodemailer = require("nodemailer");
@@ -19,7 +20,7 @@ function readBool(v, defaultWhenEmpty = false) {
 
 function getSmtpConfig() {
   const host = String(
-    process.env.MAIL_HOST || process.env.SMTP_HOST || "smtp.office365.com",
+    process.env.MAIL_HOST || process.env.SMTP_HOST || "",
   ).trim();
   const port =
     Number(process.env.MAIL_PORT || process.env.SMTP_PORT || 587) || 587;
@@ -43,7 +44,7 @@ function getSmtpConfig() {
 
 function isMailConfigured() {
   const c = getSmtpConfig();
-  return Boolean(c.user && c.pass && c.fromAddress);
+  return Boolean(c.host && c.user && c.pass && c.fromAddress);
 }
 
 function getTransporter() {
@@ -124,10 +125,12 @@ async function verifyConnection() {
 function logMailStartup() {
   const c = getSmtpConfig();
   if (isMailConfigured()) {
-    console.log(`📧 Mail: SMTP ready (${c.host}:${c.port}, from ${c.fromAddress})`);
+    console.log(
+      `📧 Mail: SMTP configured (${c.host}:${c.port}, from ${c.fromAddress}) — auth is checked on first send or when MAIL_VERIFY_ON_START=1`,
+    );
   } else {
     console.log(
-      "📧 Mail: not configured (set MAIL_USER, MAIL_PASS, MAIL_FROM, MAIL_HOST optional)",
+      "📧 Mail: not configured (set MAIL_HOST, MAIL_PORT, MAIL_USER, MAIL_PASS, MAIL_FROM — see .env.example for Resend/SendGrid)",
     );
   }
 }
