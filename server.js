@@ -19,6 +19,8 @@ const {
   removeStoredAvatar,
 } = require("./avatarStorage");
 const { applySecurity, installBodyParsers } = require("./security");
+const { logMailStartup, maybeVerifyOnStart, enqueueEmail } = require("./utils/mailer");
+const emailNotifications = require("./emailNotifications");
 const app = express();
 
 dotenv.config();
@@ -58,10 +60,21 @@ const User = mongoose.model(
   new Schema(
     {
       username: { type: String, required: true, unique: true, trim: true },
+      name: { type: String, trim: true, default: "" },
+      email: {
+        type: String,
+        trim: true,
+        lowercase: true,
+        default: null,
+        sparse: true,
+        unique: true,
+      },
       passwordHash: { type: String, required: true },
       /** One of the preset security questions (exact string). */
       securityQuestion: { type: String, default: "" },
       securityAnswerHash: { type: String, default: "" },
+      passwordResetCodeHash: { type: String, default: "" },
+      passwordResetCodeExpiresAt: { type: Date, default: null },
       /** Selected `Player` (career) document for stats entry & reads. */
       activeCareerPlayerId: {
         type: Schema.Types.ObjectId,
@@ -217,6 +230,14 @@ const MAX_DISTINCT_YEARS = 16;
 
 const MAX_USERNAME_LENGTH = 64;
 const MAX_PASSWORD_LENGTH = 128;
+const MAX_NAME_LENGTH = 120;
+const MAX_EMAIL_LENGTH = 254;
+
+function isValidEmail(s) {
+  const t = String(s ?? "").trim();
+  if (!t || t.length > MAX_EMAIL_LENGTH) return false;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t);
+}
 
 const SEASON_BODY_ROUTES = new Set([
   "season_data",
@@ -345,6 +366,8 @@ const authRouter = express.Router();
 authRouter.post("/auth/register", async (req, res) => {
   try {
     const username = String(req.body?.username || "").trim().toLowerCase();
+    const name = String(req.body?.name || "").trim();
+    const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
     const securityQuestion = String(req.body?.securityQuestion || "").trim();
     const securityAnswer = String(req.body?.securityAnswer || "");
@@ -354,6 +377,16 @@ authRouter.post("/auth/register", async (req, res) => {
           ? "Username is required"
           : `Username must be at most ${MAX_USERNAME_LENGTH} characters`,
       });
+    }
+    if (!name || name.length > MAX_NAME_LENGTH) {
+      return res.status(400).json({
+        error: !name
+          ? "Name is required"
+          : `Name must be at most ${MAX_NAME_LENGTH} characters`,
+      });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
     }
     if (
       password.length < 6 ||
@@ -378,6 +411,10 @@ authRouter.post("/auth/register", async (req, res) => {
     if (existing) {
       return res.status(409).json({ error: "Username already exists" });
     }
+    const existingEmail = await User.findOne({ email });
+    if (existingEmail) {
+      return res.status(409).json({ error: "Email already registered" });
+    }
     const passwordHash = await bcrypt.hash(password, 10);
     const securityAnswerHash = await bcrypt.hash(
       normalizeSecurityAnswer(securityAnswer),
@@ -385,6 +422,8 @@ authRouter.post("/auth/register", async (req, res) => {
     );
     const user = await User.create({
       username,
+      name,
+      email,
       passwordHash,
       securityQuestion,
       securityAnswerHash,
@@ -403,11 +442,24 @@ authRouter.post("/auth/register", async (req, res) => {
       { $set: { activeCareerPlayerId: career._id } },
     );
     const token = createToken(String(user._id));
+    emailNotifications.notifyWelcome({
+      email: user.email,
+      name: user.name,
+      username: user.username,
+    });
     return res.status(201).json({
       token,
-      user: { id: user._id, username: user.username },
+      user: {
+        id: user._id,
+        username: user.username,
+        name: user.name,
+        email: user.email,
+      },
     });
   } catch (err) {
+    if (err && err.code === 11000) {
+      return res.status(409).json({ error: "Email already registered" });
+    }
     return res.status(500).json({ error: err.message });
   }
 });
@@ -432,9 +484,22 @@ authRouter.post("/auth/login", async (req, res) => {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(401).json({ error: "Invalid credentials" });
     const token = createToken(String(user._id));
+    emailNotifications.notifyLogin(
+      {
+        email: user.email,
+        name: user.name,
+        username: user.username,
+      },
+      new Date().toISOString(),
+    );
     return res.json({
       token,
-      user: { id: user._id, username: user.username },
+      user: {
+        id: user._id,
+        username: user.username,
+        name: user.name || "",
+        email: user.email || "",
+      },
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -512,20 +577,174 @@ authRouter.post("/auth/recovery/reset", async (req, res) => {
   }
 });
 
+/** Email + 6-digit code (15 min). Same response whether or not the email exists. */
+authRouter.post("/auth/forgot-password", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+    const generic = {
+      ok: true,
+      message:
+        "If an account exists for that email, a reset code was sent. It expires in 15 minutes.",
+    };
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.json(generic);
+    }
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const passwordResetCodeHash = await bcrypt.hash(code, 10);
+    const passwordResetCodeExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
+    await User.updateOne(
+      { _id: user._id },
+      { $set: { passwordResetCodeHash, passwordResetCodeExpiresAt } },
+    );
+    emailNotifications.notifyPasswordResetCode(
+      {
+        email: user.email,
+        name: user.name,
+        username: user.username,
+      },
+      code,
+    );
+    return res.json(generic);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+authRouter.post("/auth/verify-reset-code", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    if (!isValidEmail(email) || !/^\d{6}$/.test(code)) {
+      return res
+        .status(400)
+        .json({ error: "Valid email and 6-digit code are required" });
+    }
+    const user = await User.findOne({ email }).select(
+      "passwordResetCodeHash passwordResetCodeExpiresAt",
+    );
+    if (
+      !user ||
+      !user.passwordResetCodeHash ||
+      !user.passwordResetCodeExpiresAt
+    ) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+    if (user.passwordResetCodeExpiresAt < new Date()) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+    const match = await bcrypt.compare(code, user.passwordResetCodeHash);
+    if (!match) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+authRouter.post("/auth/reset-password", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const code = String(req.body?.code || "").trim();
+    const newPassword = String(req.body?.newPassword || "");
+    if (
+      !isValidEmail(email) ||
+      !/^\d{6}$/.test(code) ||
+      newPassword.length < 6 ||
+      newPassword.length > MAX_PASSWORD_LENGTH
+    ) {
+      return res.status(400).json({
+        error:
+          "Valid email, 6-digit code, and new password (min 6 characters) are required",
+      });
+    }
+    const user = await User.findOne({ email });
+    if (
+      !user ||
+      !user.passwordResetCodeHash ||
+      !user.passwordResetCodeExpiresAt
+    ) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+    if (user.passwordResetCodeExpiresAt < new Date()) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+    const match = await bcrypt.compare(code, user.passwordResetCodeHash);
+    if (!match) {
+      return res.status(400).json({ error: "Invalid or expired code" });
+    }
+    user.passwordHash = await bcrypt.hash(newPassword, 10);
+    user.passwordResetCodeHash = "";
+    user.passwordResetCodeExpiresAt = null;
+    await user.save();
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 const router = express.Router();
 
 router.get("/me", async (req, res) => {
   try {
     const u = await User.findById(req.user.userId).select(
-      "username securityQuestion securityAnswerHash",
+      "username name email securityQuestion securityAnswerHash",
     );
     if (!u) return res.status(404).json({ error: "Not found" });
     res.json({
       username: u.username,
+      name: u.name || "",
+      email: u.email || "",
       hasSecurityRecovery: Boolean(u.securityAnswerHash && u.securityQuestion),
       securityQuestion: u.securityQuestion || null,
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.patch("/users/me", async (req, res) => {
+  try {
+    const name = String(req.body?.name ?? "").trim();
+    const email = String(req.body?.email ?? "").trim().toLowerCase();
+    if (!name || name.length > MAX_NAME_LENGTH) {
+      return res.status(400).json({
+        error: !name
+          ? "Name is required"
+          : `Name must be at most ${MAX_NAME_LENGTH} characters`,
+      });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+    const oid = playerObjectId(req.user.userId);
+    const user = await User.findById(oid);
+    if (!user) return res.status(404).json({ error: "Not found" });
+    const dup = await User.findOne({
+      email,
+      _id: { $ne: oid },
+    })
+      .select("_id")
+      .lean();
+    if (dup) {
+      return res.status(409).json({ error: "Email already in use" });
+    }
+    user.name = name;
+    user.email = email;
+    await user.save();
+    res.json({
+      username: user.username,
+      name: user.name,
+      email: user.email,
+    });
+  } catch (err) {
+    if (err && err.code === 11000) {
+      return res.status(409).json({ error: "Email already in use" });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -649,7 +868,13 @@ router.get("/data_entry_status", async (req, res) => {
   }
 });
 
-function createCareerCrud(model, routeName) {
+/**
+ * @param {import('mongoose').Model} model
+ * @param {string} routeName
+ * @param {{ onCreated?: (userId: string, doc: object) => void, onUpdated?: (userId: string, oldDoc: object, newDoc: object) => void }} [mailHooks]
+ */
+function createCareerCrud(model, routeName, mailHooks = {}) {
+  const hooks = mailHooks || {};
   router.post(`/${routeName}`, async (req, res) => {
     try {
       const careerId = await resolveCareerPlayerId(req);
@@ -673,6 +898,17 @@ function createCareerCrud(model, routeName) {
         req.body && typeof req.body === "object" ? req.body : {};
       const doc = new model({ ...rest, playerId: careerId });
       await doc.save();
+      if (hooks.onCreated) {
+        const uid = String(req.user.userId);
+        const plain = doc.toObject();
+        enqueueEmail(() => {
+          try {
+            hooks.onCreated(uid, plain);
+          } catch (e) {
+            console.error("[mail] onCreated:", e);
+          }
+        });
+      }
       res.status(201).json(doc);
     } catch (err) {
       res.status(400).json({ error: err.message });
@@ -711,6 +947,9 @@ function createCareerCrud(model, routeName) {
       if (!careerId) {
         return res.status(400).json({ error: "No active career profile selected." });
       }
+      const oldDoc = await model
+        .findOne({ _id: req.params.id, playerId: careerId })
+        .lean();
       const { playerId: _ignore, ...rest } =
         req.body && typeof req.body === "object" ? req.body : {};
       const doc = await model.findOneAndUpdate(
@@ -719,6 +958,17 @@ function createCareerCrud(model, routeName) {
         { new: true },
       );
       if (!doc) return res.status(404).json({ error: "Not found" });
+      if (hooks.onUpdated && oldDoc) {
+        const uid = String(req.user.userId);
+        const plainNew = doc.toObject();
+        enqueueEmail(() => {
+          try {
+            hooks.onUpdated(uid, oldDoc, plainNew);
+          } catch (e) {
+            console.error("[mail] onUpdated:", e);
+          }
+        });
+      }
       res.json(doc);
     } catch (err) {
       res.status(400).json({ error: err.message });
@@ -951,8 +1201,18 @@ router.delete("/players/:id", async (req, res) => {
   }
 });
 
-createCareerCrud(SeasonData, "season_data");
-createCareerCrud(YearlyData, "yearly_data");
+createCareerCrud(SeasonData, "season_data", {
+  onCreated: (userId, row) =>
+    emailNotifications.notifySeasonDataAdded(userId, row),
+  onUpdated: (userId, oldRow, newRow) =>
+    emailNotifications.notifySeasonDataUpdated(userId, oldRow, newRow),
+});
+createCareerCrud(YearlyData, "yearly_data", {
+  onCreated: (userId, row) =>
+    emailNotifications.notifyYearlyDataAdded(userId, row),
+  onUpdated: (userId, oldRow, newRow) =>
+    emailNotifications.notifyYearlyDataUpdated(userId, oldRow, newRow),
+});
 createCareerCrud(SeasonTrophy, "season_trophies");
 createCareerCrud(IntData, "int_data");
 createCareerCrud(IntTrophy, "int_trophies");
@@ -969,4 +1229,6 @@ app.listen(PORT, () => {
       ? "📦 Avatars: Cloudflare R2"
       : "📦 Avatars: local disk (./uploads/avatars)",
   );
+  logMailStartup();
+  void maybeVerifyOnStart();
 });
